@@ -1,5 +1,5 @@
 {
-  "name": "wealthfolio-plaid-sync-addon",
+  "name": "wealthfolio-account-sync-addon",
   "version": "0.2.0",
   "description": "Auto-sync bank, credit, and brokerage accounts via Plaid and SnapTrade",
   "type": "module",
