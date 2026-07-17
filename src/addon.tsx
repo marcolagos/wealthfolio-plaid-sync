@@ -28,7 +28,7 @@ const enable: AddonEnableFunction = (ctx) => {
 
   const sidebarItem = ctx.sidebar.addItem({
     id: "plaid-sync",
-    label: "Plaid Sync",
+    label: "Account Sync",
     icon: "credit-card",
     route: "/addons/plaid-sync",
     order: 101,

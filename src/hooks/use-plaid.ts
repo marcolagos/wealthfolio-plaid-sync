@@ -1,9 +1,15 @@
 import type { Account, AddonContext } from "@wealthfolio/addon-sdk";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo } from "react";
-import { loadMapping, saveMapping, type AccountMapping } from "../lib/mapping";
+import {
+  loadMapping,
+  saveMapping,
+  type AccountMapping,
+  type SyncProvider,
+} from "../lib/mapping";
 import { PlaidClient } from "../plaid/client";
 import type { PlaidAccount, PlaidEnv } from "../plaid/types";
+import { SnapTradeClient } from "../snaptrade/client";
 import { AUTO_SYNC_HOURS_KEY, getAutoSyncHours } from "../sync/auto-sync";
 import { loadSyncLog, runSync } from "../sync/orchestrator";
 
@@ -18,6 +24,8 @@ const K = {
   syncLog: ["plaid-sync", "sync-log"] as const,
   autoSyncHours: ["plaid-sync", "auto-sync-hours"] as const,
   historyDays: ["plaid-sync", "history-days"] as const,
+  snapConfigured: ["plaid-sync", "snaptrade-configured"] as const,
+  snapAuthorizations: ["plaid-sync", "snaptrade-authorizations"] as const,
 };
 
 export function usePlaidClient(ctx: AddonContext): PlaidClient {
@@ -65,14 +73,21 @@ export function useItems(ctx: AddonContext) {
 }
 
 export interface PlaidAccountRow {
+  provider: SyncProvider;
+  /** Plaid item id / SnapTrade brokerage authorization id. */
   itemId: string;
   institutionName?: string;
   account: PlaidAccount;
 }
 
-/** Flat list of all accounts across connected items, for the mapping table. */
+/**
+ * Flat list of mappable accounts across both providers, for the mapping
+ * table. SnapTrade accounts are shaped as pseudo Plaid accounts (type
+ * "investment") so the mapping row logic applies unchanged.
+ */
 export function usePlaidAccounts(ctx: AddonContext, enabled: boolean) {
   const client = usePlaidClient(ctx);
+  const snap = useSnapTradeClient(ctx);
   return useQuery({
     queryKey: K.plaidAccounts,
     queryFn: async (): Promise<PlaidAccountRow[]> => {
@@ -82,9 +97,30 @@ export function usePlaidAccounts(ctx: AddonContext, enabled: boolean) {
         const accounts = await client.getAccounts(item.itemId);
         for (const account of accounts) {
           rows.push({
+            provider: "plaid",
             itemId: item.itemId,
             institutionName: item.institutionName,
             account,
+          });
+        }
+      }
+      if (await snap.isConfigured()) {
+        for (const account of await snap.listAccounts()) {
+          rows.push({
+            provider: "snaptrade",
+            itemId: account.brokerage_authorization,
+            institutionName: account.institution_name ?? "SnapTrade",
+            account: {
+              account_id: account.id,
+              name: account.name,
+              type: "investment",
+              subtype: account.raw_type?.toLowerCase() ?? null,
+              mask: account.number?.replace(/\*/g, "").slice(-4) ?? null,
+              balances: {
+                current: account.balance?.total?.amount ?? null,
+                iso_currency_code: account.balance?.total?.currency ?? "USD",
+              },
+            } as PlaidAccount,
           });
         }
       }
@@ -240,6 +276,65 @@ export function useSyncMutation(ctx: AddonContext) {
       } else {
         ctx.api.toast.success(`Sync complete: ${imported} activities imported`);
       }
+    },
+    onError: (error: Error) => ctx.api.toast.error(error.message),
+  });
+}
+
+// ── SnapTrade ──────────────────────────────────────────────────────
+
+export function useSnapTradeClient(ctx: AddonContext): SnapTradeClient {
+  return useMemo(() => new SnapTradeClient(ctx), [ctx]);
+}
+
+export function useSnapTradeConfigured(ctx: AddonContext) {
+  const snap = useSnapTradeClient(ctx);
+  return useQuery({ queryKey: K.snapConfigured, queryFn: () => snap.isConfigured() });
+}
+
+export function useSaveSnapTradeCredentialsMutation(ctx: AddonContext) {
+  const snap = useSnapTradeClient(ctx);
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ clientId, consumerKey }: { clientId: string; consumerKey: string }) =>
+      snap.saveCredentials(clientId, consumerKey),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: K.snapConfigured });
+      queryClient.invalidateQueries({ queryKey: K.snapAuthorizations });
+      queryClient.invalidateQueries({ queryKey: K.plaidAccounts });
+      ctx.api.toast.success("SnapTrade credentials saved");
+    },
+    onError: (error: Error) => ctx.api.toast.error(error.message),
+  });
+}
+
+export function useSnapTradeAuthorizations(ctx: AddonContext, enabled: boolean) {
+  const snap = useSnapTradeClient(ctx);
+  return useQuery({
+    queryKey: K.snapAuthorizations,
+    queryFn: () => snap.listAuthorizations(),
+    enabled,
+    staleTime: 60 * 1000,
+  });
+}
+
+export function useSnapTradePortalMutation(ctx: AddonContext) {
+  const snap = useSnapTradeClient(ctx);
+  return useMutation({
+    mutationFn: () => snap.createPortalUrl(),
+    onError: (error: Error) => ctx.api.toast.error(error.message),
+  });
+}
+
+export function useRemoveSnapTradeAuthorizationMutation(ctx: AddonContext) {
+  const snap = useSnapTradeClient(ctx);
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (authorizationId: string) => snap.removeAuthorization(authorizationId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: K.snapAuthorizations });
+      queryClient.invalidateQueries({ queryKey: K.plaidAccounts });
+      ctx.api.toast.success("Connection removed");
     },
     onError: (error: Error) => ctx.api.toast.error(error.message),
   });

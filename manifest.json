@@ -1,15 +1,15 @@
 {
   "id": "plaid-sync",
-  "name": "Plaid Sync",
-  "version": "0.1.1",
-  "description": "Auto-sync bank and brokerage accounts via Plaid",
+  "name": "Account Sync",
+  "version": "0.2.0",
+  "description": "Auto-sync bank, credit, and brokerage accounts via Plaid and SnapTrade",
   "author": "Marco Lagos",
   "main": "dist/addon.js",
   "sdkVersion": "3.6.2",
   "minWealthfolioVersion": "3.6.2",
   "enabled": true,
   "network": {
-    "allowedHosts": ["sandbox.plaid.com", "production.plaid.com"]
+    "allowedHosts": ["sandbox.plaid.com", "production.plaid.com", "api.snaptrade.com"]
   },
   "permissions": [
     {
@@ -25,12 +25,12 @@
     {
       "category": "secrets",
       "functions": ["set", "get", "use", "delete"],
-      "purpose": "Store Plaid API credentials and access tokens securely"
+      "purpose": "Store Plaid/SnapTrade API credentials and access tokens securely"
     },
     {
       "category": "network",
       "functions": ["request"],
-      "purpose": "Fetch account data from the Plaid API"
+      "purpose": "Fetch account data from the Plaid and SnapTrade APIs"
     }
   ],
   "hostDependencies": {

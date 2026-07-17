@@ -1,41 +1,48 @@
-# Plaid Sync
+# Account Sync
 
-Wealthfolio addon that auto-syncs bank and brokerage accounts via
-[Plaid](https://plaid.com/). Works with Plaid's free **Trial plan** (up to 10
-live institutions, includes Transactions + Investments).
+Wealthfolio addon that auto-syncs bank, credit, and brokerage accounts from
+two providers, each doing what it's best at:
+
+- **[Plaid](https://plaid.com/)** — banks and credit cards (free Trial plan:
+  10 institutions, Transactions + Investments).
+- **[SnapTrade](https://snaptrade.com/)** — brokerages (Robinhood, Fidelity,
+  E\*Trade, Schwab, …) with broker-complete history, read-only (free tier:
+  5 connections).
 
 ## How it works
 
-- **Bank / credit accounts** sync as activities (deposits, withdrawals,
-  interest, fees) via `/transactions/sync` cursors. Depository accounts get an
-  opening-balance anchor on first sync so computed balances match reported ones.
-- **Brokerage / retirement accounts** sync as **real investment activities**
-  (BUY/SELL/DIVIDEND/FEE with quantity, price, and fees) via
-  `/investments/transactions/get` — full cost basis and history. Positions
-  predating Plaid's ~24-month history window come in as baseline TRANSFER_INs
-  computed from current holdings, plus a cash anchor.
-- **Dedup**: each activity carries its Plaid transaction id in the comment
-  (`[plaid:<id>]`), folded into Wealthfolio's content-hash idempotency; re-syncs
-  never double-import. Symbol-bearing rows are saved through the asset-creating
-  path so tickers resolve to real market-data assets.
+- **Bank / credit accounts (Plaid)** sync as activities via
+  `/transactions/sync` cursors. Depository accounts get an opening-balance
+  anchor on first sync; credit-card payments and refunds import as CREDIT.
+  History depth is configurable up to Plaid's 730-day cap.
+- **Brokerages (SnapTrade)** sync as real investment activities
+  (BUY/SELL/DIVIDEND/reinvestments/transfers with quantity, price, and fees)
+  from the broker's full available history — no 24-month cap. Positions
+  predating the history come in as baseline TRANSFER_INs; money-market sweep
+  churn (SPAXX-style) is skipped. Plaid investment accounts work too, when
+  the institution supports them.
+- **Dedup**: every activity carries its provider transaction id in the
+  comment (`[plaid:<id>]` / `[snaptrade:<id>]`), folded into Wealthfolio's
+  content-hash idempotency; re-syncs never double-import. Symbol rows go
+  through the asset-creating import path so tickers resolve to real
+  market-data assets.
 - **Auto-sync** runs at app launch when the last run is older than the
   configured interval (default daily, or manual-only).
-- Loans are listed but not synced (no liability model in v1).
 
 ## Setup
 
-1. Create a Plaid account at dashboard.plaid.com (Trial plan is automatic for
-   new US/Canada teams) and grab your `client_id` and environment secret.
-2. In Wealthfolio → Plaid Sync: pick the environment, paste `client_id` +
-   secret, Save. Credentials live in the encrypted secret store; API calls embed
-   them per-request and never touch the browser context.
-3. Connect an institution:
-   - **Production**: "Connect an institution" creates a Hosted Link session —
-     copy the URL into your browser, sign in to your bank, come back and press
-     "Check connection".
-   - **Sandbox**: "Quick connect" wires up Plaid's test bank (credentials
-     `user_good` / `pass_good`) without the Link UI.
-4. Map each Plaid account (create new / link existing / ignore) and Sync now.
+1. **Plaid** (banks/cards): create a team at dashboard.plaid.com, paste
+   `client_id` + environment secret, connect institutions via Hosted Link.
+2. **SnapTrade** (brokerages): create an account at dashboard.snaptrade.com,
+   paste the `client_id` (PERS-…) + consumer key. Connect brokerages via the
+   "Connect a brokerage" portal link — or directly in SnapTrade's own
+   dashboard; connections made there appear here automatically.
+3. Map each discovered account (create new / link existing / ignore) and
+   press **Sync now**.
+
+All credentials live in Wealthfolio's encrypted secret store; SnapTrade
+requests are HMAC-signed in the addon and neither key ever leaves the
+server-side network broker.
 
 ## Development
 
@@ -48,7 +55,9 @@ pnpm bundle       # build + package ZIP for installation
 Releases: push a `v*` tag and CI attaches the installable ZIP to a GitHub
 Release.
 
-E2E coverage: `e2e/98-plaid-addon.spec.ts` in a
-[wealthfolio](https://github.com/afadil/wealthfolio) checkout runs the full
-sandbox flow (connect → map → sync → dedup → holdings) against a running
-web-mode app.
+E2E coverage (in a [wealthfolio](https://github.com/afadil/wealthfolio)
+checkout, against a running web-mode app):
+
+- `e2e/98-plaid-addon.spec.ts` — full Plaid Sandbox flow.
+- `e2e/99-snaptrade-sync.spec.ts` — live SnapTrade flow; requires
+  `SNAPTRADE_CLIENT_ID` / `SNAPTRADE_CONSUMER_KEY` env vars.

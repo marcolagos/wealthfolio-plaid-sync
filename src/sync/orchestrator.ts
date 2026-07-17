@@ -1,5 +1,5 @@
 import type { ActivityImport, AddonContext } from "@wealthfolio/addon-sdk";
-import { loadMapping, type SyncKind } from "../lib/mapping";
+import { linkProvider, loadMapping, type SyncKind } from "../lib/mapping";
 import { PlaidClient, type PlaidItemRef } from "../plaid/client";
 import type {
   PlaidAccount,
@@ -7,11 +7,17 @@ import type {
   PlaidSecurity,
   PlaidTransaction,
 } from "../plaid/types";
+import { SnapTradeClient } from "../snaptrade/client";
+import type { SnapTradeAccount } from "../snaptrade/types";
 import { buildBankingAnchor, mapBankingTransactions } from "./map-banking";
 import {
   buildInvestmentBaseline,
   mapInvestmentTransactions,
 } from "./map-investments";
+import {
+  buildSnapTradeBaseline,
+  mapSnapTradeActivities,
+} from "./map-snaptrade";
 
 const STATE_KEY = "plaid-sync-state";
 const LOG_KEY = "plaid-sync-log";
@@ -27,7 +33,9 @@ interface SyncState {
   cursors: Record<string, string>;
   /** Last synced end-date (YYYY-MM-DD) per item for investments. */
   invCheckpoints: Record<string, string>;
-  /** Plaid account_ids whose opening baseline/anchor has been imported. */
+  /** Last synced end-date (YYYY-MM-DD) per SnapTrade account. */
+  snapCheckpoints: Record<string, string>;
+  /** Provider account ids whose opening baseline/anchor has been imported. */
   baselined: string[];
 }
 
@@ -57,13 +65,19 @@ async function loadState(ctx: AddonContext): Promise<SyncState> {
       return {
         cursors: parsed.cursors ?? {},
         invCheckpoints: parsed.invCheckpoints ?? {},
+        snapCheckpoints: parsed.snapCheckpoints ?? {},
         baselined: Array.isArray(parsed.baselined) ? parsed.baselined : [],
       };
     } catch {
       // corrupted state → full re-sync; dedup makes that safe
     }
   }
-  return { cursors: {}, invCheckpoints: {}, baselined: [] };
+  return {
+    cursors: {},
+    invCheckpoints: {},
+    snapCheckpoints: {},
+    baselined: [],
+  };
 }
 
 export async function loadSyncLog(ctx: AddonContext): Promise<SyncRunResult[]> {
@@ -437,6 +451,114 @@ async function syncItemInvestments(
 }
 
 /**
+ * SnapTrade accounts are investment-only: one activities feed per account
+ * with broker-complete history (no 730-day cap). First sync fetches from the
+ * broker's first_transaction_date and adds a positions-derived baseline;
+ * incremental syncs re-fetch a small overlap that dedup absorbs.
+ */
+async function syncSnapTradeAccounts(
+  ctx: AddonContext,
+  snap: SnapTradeClient,
+  links: { plaidAccountId: string; wfAccountId: string }[],
+  state: SyncState,
+  outcomes: AccountSyncOutcome[],
+): Promise<void> {
+  const today = new Date().toISOString().slice(0, 10);
+  const accounts = new Map<string, SnapTradeAccount>(
+    (await snap.listAccounts()).map((a) => [a.id, a]),
+  );
+
+  for (const m of links) {
+    const account = accounts.get(m.plaidAccountId);
+    const institution = account?.institution_name ?? "";
+    const outcome: AccountSyncOutcome = {
+      plaidAccountId: m.plaidAccountId,
+      name: account
+        ? institution &&
+          !account.name.toLowerCase().includes(institution.toLowerCase())
+          ? `${institution} ${account.name}`
+          : account.name
+        : m.plaidAccountId,
+      kind: "INVESTMENTS",
+      imported: 0,
+      duplicates: 0,
+      skippedRows: 0,
+    };
+    try {
+      if (!account) {
+        throw new Error(
+          "Account no longer exists in SnapTrade — reconnect or remap",
+        );
+      }
+      const checkpoint = state.snapCheckpoints[m.plaidAccountId];
+      const isNew = !state.baselined.includes(m.plaidAccountId);
+      const start =
+        checkpoint && !isNew
+          ? new Date(
+              new Date(`${checkpoint}T00:00:00Z`).getTime() -
+                OVERLAP_DAYS * 86400_000,
+            )
+              .toISOString()
+              .slice(0, 10)
+          : (account.sync_status?.transactions?.first_transaction_date ??
+            isoDaysAgo(3650));
+      const currency = account.balance?.total?.currency ?? "USD";
+
+      const activities = await snap.accountActivities(
+        m.plaidAccountId,
+        start,
+        today,
+      );
+      const { rows, skipped } = mapSnapTradeActivities(
+        activities,
+        m.wfAccountId,
+        currency,
+      );
+      outcome.skippedRows = skipped.length;
+      if (skipped.length > 0) {
+        outcome.note = `${skipped.length} row(s) skipped — e.g. ${skipped[0].reason}`;
+      }
+
+      if (isNew) {
+        const positions = await snap.accountPositions(m.plaidAccountId);
+        const earliest =
+          rows.length > 0 && typeof rows[0].date === "string"
+            ? rows[0].date
+            : null;
+        const baseline = buildSnapTradeBaseline(
+          positions,
+          rows,
+          m.plaidAccountId,
+          m.wfAccountId,
+          currency,
+          earliest,
+        );
+        rows.unshift(...baseline);
+      }
+
+      const { imported, duplicates, invalid, invalidExample } =
+        await importRows(ctx, rows);
+      outcome.imported = imported;
+      outcome.duplicates = duplicates;
+      if (invalid > 0) {
+        outcome.skippedRows += invalid;
+        outcome.note = [
+          outcome.note,
+          `${invalid} row(s) rejected by import validation — e.g. ${invalidExample}`,
+        ]
+          .filter(Boolean)
+          .join("; ");
+      }
+      if (isNew) state.baselined.push(m.plaidAccountId);
+      state.snapCheckpoints[m.plaidAccountId] = today;
+    } catch (error) {
+      outcome.error = error instanceof Error ? error.message : String(error);
+    }
+    outcomes.push(outcome);
+  }
+}
+
+/**
  * Item-level fetch failures (e.g. PRODUCTS_NOT_SUPPORTED from an institution
  * that lacks a product) must not abort the rest of the run: record them on
  * each affected account and move on, so other institutions still sync and
@@ -476,7 +598,10 @@ export async function runSync(ctx: AddonContext): Promise<SyncRunResult> {
 
     for (const item of items) {
       const links = Object.entries(mapping.links)
-        .filter(([, link]) => link.itemId === item.itemId)
+        .filter(
+          ([, link]) =>
+            linkProvider(link) === "plaid" && link.itemId === item.itemId,
+        )
         .map(([plaidAccountId, link]) => ({ plaidAccountId, ...link }));
       if (links.length === 0) continue;
 
@@ -520,6 +645,36 @@ export async function runSync(ctx: AddonContext): Promise<SyncRunResult> {
           );
         } catch (error) {
           recordItemFailure(run.outcomes, item, investments, error);
+        }
+      }
+    }
+
+    const snapLinks = Object.entries(mapping.links)
+      .filter(([, link]) => linkProvider(link) === "snaptrade")
+      .map(([plaidAccountId, link]) => ({ plaidAccountId, ...link }));
+    if (snapLinks.length > 0) {
+      try {
+        await syncSnapTradeAccounts(
+          ctx,
+          new SnapTradeClient(ctx),
+          snapLinks,
+          state,
+          run.outcomes,
+        );
+      } catch (error) {
+        // Account-level failures are recorded inside; this catches feed-level
+        // ones (credentials, listAccounts) so Plaid results still land.
+        const message = error instanceof Error ? error.message : String(error);
+        for (const link of snapLinks) {
+          run.outcomes.push({
+            plaidAccountId: link.plaidAccountId,
+            name: "SnapTrade",
+            kind: link.kind,
+            imported: 0,
+            duplicates: 0,
+            skippedRows: 0,
+            error: message,
+          });
         }
       }
     }

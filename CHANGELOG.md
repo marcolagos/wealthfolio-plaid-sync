@@ -1,8 +1,27 @@
 # Changelog
 
-All notable changes to the plaid-sync addon are documented here. The format
-follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and the
-project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+All notable changes to this addon are documented here. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and the project
+adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.2.0] - 2026-07-18
+
+### Added
+
+- **SnapTrade provider**: brokerage connections (Robinhood, Fidelity,
+  E\*Trade, Schwab, …) with broker-complete history — no 24-month cap.
+  Personal-API-key auth with per-request HMAC-SHA256 signing computed in the
+  addon; Connection Portal link for connecting brokerages; per-account
+  incremental checkpoints with overlap dedup (`[snaptrade:<id>]` markers);
+  positions-derived baselines with a cash anchor for cash-equivalent
+  holdings; money-market sweep trades (SPAXX-style) skipped as cash churn.
+- SnapTrade accounts appear in the same mapping table (institution-prefixed
+  names) and sync log as Plaid accounts.
+
+### Changed
+
+- Addon renamed **Plaid Sync → Account Sync** (id unchanged — existing
+  credentials, connections, and mappings carry over).
 
 ## [0.1.1] - 2026-07-16
 

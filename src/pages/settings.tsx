@@ -35,9 +35,14 @@ import {
   usePlaidEnv,
   usePollHostedLinkMutation,
   useRemoveItemMutation,
+  useRemoveSnapTradeAuthorizationMutation,
   useSandboxConnectMutation,
   useSaveCredentialsMutation,
   useSaveMappingMutation,
+  useSaveSnapTradeCredentialsMutation,
+  useSnapTradeAuthorizations,
+  useSnapTradeConfigured,
+  useSnapTradePortalMutation,
   useSyncLog,
   useSyncMutation,
   useWealthfolioAccounts,
@@ -295,6 +300,135 @@ function ConnectCard({ ctx }: { ctx: AddonContext }) {
   );
 }
 
+function SnapTradeCard({
+  ctx,
+  compact,
+}: {
+  ctx: AddonContext;
+  compact: boolean;
+}) {
+  const save = useSaveSnapTradeCredentialsMutation(ctx);
+  const auths = useSnapTradeAuthorizations(ctx, compact);
+  const portal = useSnapTradePortalMutation(ctx);
+  const removeAuth = useRemoveSnapTradeAuthorizationMutation(ctx);
+  const [clientId, setClientId] = useState("");
+  const [consumerKey, setConsumerKey] = useState("");
+  const [copied, setCopied] = useState(false);
+
+  const portalUrl = portal.data?.redirectURI;
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center justify-between">
+          <span>
+            SnapTrade brokerages{" "}
+            {compact && <Badge className="ml-2">Configured</Badge>}
+          </span>
+        </CardTitle>
+        <CardDescription>
+          Brokerage connections (Robinhood, Fidelity, E*Trade, Schwab…) with
+          broker-complete history. Keys come from the SnapTrade dashboard; the
+          free tier covers 5 connections.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="flex items-center gap-3">
+          <Input
+            placeholder="client_id (PERS-…)"
+            value={clientId}
+            onChange={(e) => setClientId(e.target.value)}
+            className="w-72"
+          />
+          <Input
+            placeholder={compact ? "consumer key (unchanged)" : "consumer key"}
+            type="password"
+            value={consumerKey}
+            onChange={(e) => setConsumerKey(e.target.value)}
+            className="w-72"
+          />
+          <Button
+            onClick={() => save.mutate({ clientId, consumerKey })}
+            disabled={!clientId.trim() || !consumerKey.trim() || save.isPending}
+          >
+            {save.isPending ? "Saving…" : "Save"}
+          </Button>
+        </div>
+
+        {compact && (
+          <>
+            <div className="flex items-center gap-3">
+              <Button
+                variant="outline"
+                onClick={() => portal.mutate()}
+                disabled={portal.isPending}
+              >
+                {portal.isPending ? "Creating link…" : "Connect a brokerage"}
+              </Button>
+            </div>
+
+            {portalUrl && (
+              <div className="space-y-2 rounded-md border p-3">
+                <p className="text-sm">
+                  Open this link in your browser and sign in to your brokerage.
+                  Connected accounts appear in the table below (allow a minute
+                  for SnapTrade's first data sync).
+                </p>
+                <div className="flex items-center gap-2">
+                  <Input
+                    readOnly
+                    value={portalUrl}
+                    className="flex-1 text-xs"
+                  />
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      void navigator.clipboard
+                        .writeText(portalUrl)
+                        .then(() => setCopied(true));
+                    }}
+                  >
+                    {copied ? "Copied" : "Copy"}
+                  </Button>
+                </div>
+              </div>
+            )}
+
+            {(auths.data ?? []).length > 0 && (
+              <div className="space-y-1">
+                {(auths.data ?? []).map((auth) => (
+                  <div
+                    key={auth.id}
+                    className="flex items-center justify-between rounded-md border px-3 py-2"
+                  >
+                    <span className="text-sm">
+                      {auth.brokerage?.name ?? auth.id}{" "}
+                      {auth.disabled && (
+                        <Badge variant="destructive" className="ml-1">
+                          disconnected
+                        </Badge>
+                      )}
+                    </span>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => removeAuth.mutate(auth.id)}
+                      disabled={removeAuth.isPending}
+                    >
+                      Remove
+                    </Button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
 function MappingRow({
   ctx,
   row,
@@ -317,6 +451,16 @@ function MappingRow({
     ? IGNORE_OPTION
     : (link?.wfAccountId ?? UNMAPPED_OPTION);
   const currency = row.account.balances.iso_currency_code ?? "USD";
+  // SnapTrade account names are broker-generic ("ROTH IRA") — prefix the
+  // institution so rows and created accounts are distinguishable (unless the
+  // broker already includes it, e.g. "Robinhood Individual").
+  const institution = row.institutionName ?? "";
+  const displayName =
+    row.provider === "snaptrade" &&
+    institution &&
+    !row.account.name.toLowerCase().includes(institution.toLowerCase())
+      ? `${institution} ${row.account.name}`
+      : row.account.name;
 
   const applyTarget = async (value: string) => {
     if (!kind) return;
@@ -331,7 +475,7 @@ function MappingRow({
       delete next.links[plaidId];
     } else if (value === CREATE_OPTION) {
       const created = await createAccount.mutateAsync({
-        name: row.account.name.slice(0, 50),
+        name: displayName.slice(0, 50),
         accountType:
           kind === "INVESTMENTS"
             ? "SECURITIES"
@@ -342,7 +486,7 @@ function MappingRow({
         isDefault: false,
         isActive: true,
         trackingMode: "TRANSACTIONS",
-        provider: "plaid",
+        provider: row.provider,
         providerAccountId: plaidId,
         group: row.institutionName,
       });
@@ -350,10 +494,16 @@ function MappingRow({
         wfAccountId: created.id,
         kind,
         itemId: row.itemId,
+        provider: row.provider,
       };
       ctx.api.toast.success(`Created account "${created.name}"`);
     } else {
-      next.links[plaidId] = { wfAccountId: value, kind, itemId: row.itemId };
+      next.links[plaidId] = {
+        wfAccountId: value,
+        kind,
+        itemId: row.itemId,
+        provider: row.provider,
+      };
     }
     onSave(next);
   };
@@ -361,8 +511,9 @@ function MappingRow({
   return (
     <TableRow>
       <TableCell>
-        <div className="font-medium">{row.account.name}</div>
+        <div className="font-medium">{displayName}</div>
         <div className="text-muted-foreground text-xs">
+          {row.provider === "snaptrade" ? "snaptrade · " : ""}
           {row.account.type}
           {row.account.subtype ? ` · ${row.account.subtype}` : ""}
           {row.account.mask ? ` · …${row.account.mask}` : ""}
@@ -543,29 +694,33 @@ function SyncCard({ ctx, hasLinks }: { ctx: AddonContext; hasLinks: boolean }) {
 
 export function SettingsPage({ ctx }: { ctx: AddonContext }) {
   const configured = useConfigured(ctx);
+  const snapConfigured = useSnapTradeConfigured(ctx);
   const items = useItems(ctx);
   const mapping = useAccountMapping(ctx);
   const hasItems = (items.data ?? []).length > 0;
   const hasLinks = Object.keys(mapping.data?.links ?? {}).length > 0;
+  const showAccounts = Boolean(
+    (configured.data && hasItems) || snapConfigured.data,
+  );
 
   return (
     <div className="space-y-6 p-6">
       <div>
-        <h1 className="text-2xl font-semibold">Plaid Sync</h1>
+        <h1 className="text-2xl font-semibold">Account Sync</h1>
         <p className="text-muted-foreground">
-          Auto-sync bank and brokerage accounts via Plaid.
+          Auto-sync bank, credit, and brokerage accounts via Plaid and
+          SnapTrade.
         </p>
       </div>
-      {configured.isLoading ? (
+      {configured.isLoading || snapConfigured.isLoading ? (
         <Skeleton className="h-40 w-full" />
       ) : (
         <>
           <CredentialsCard ctx={ctx} compact={Boolean(configured.data)} />
           {configured.data && <ConnectCard ctx={ctx} />}
-          {configured.data && hasItems && <AccountsCard ctx={ctx} />}
-          {configured.data && hasItems && (
-            <SyncCard ctx={ctx} hasLinks={hasLinks} />
-          )}
+          <SnapTradeCard ctx={ctx} compact={Boolean(snapConfigured.data)} />
+          {showAccounts && <AccountsCard ctx={ctx} />}
+          {showAccounts && <SyncCard ctx={ctx} hasLinks={hasLinks} />}
         </>
       )}
     </div>
