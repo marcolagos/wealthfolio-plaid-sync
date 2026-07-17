@@ -27,6 +27,8 @@ import {
   useAutoSyncHours,
   useConfigured,
   useCreateAccountMutation,
+  useExtendHistoryLinkMutation,
+  useHistoryDays,
   useHostedLinkMutation,
   useItems,
   usePlaidAccounts,
@@ -42,6 +44,7 @@ import {
   type PlaidAccountRow,
 } from "../hooks/use-plaid";
 import type { AccountMapping, SyncKind } from "../lib/mapping";
+import { MAX_HISTORY_DAYS } from "../plaid/client";
 import type { PlaidEnv } from "../plaid/types";
 
 const CREATE_OPTION = "__create__";
@@ -54,7 +57,13 @@ function suggestedKind(row: PlaidAccountRow): SyncKind | null {
   return "BANKING";
 }
 
-function CredentialsCard({ ctx, compact }: { ctx: AddonContext; compact: boolean }) {
+function CredentialsCard({
+  ctx,
+  compact,
+}: {
+  ctx: AddonContext;
+  compact: boolean;
+}) {
   const env = usePlaidEnv(ctx);
   const save = useSaveCredentialsMutation(ctx);
   const [clientId, setClientId] = useState("");
@@ -68,17 +77,22 @@ function CredentialsCard({ ctx, compact }: { ctx: AddonContext; compact: boolean
         <CardTitle className="flex items-center justify-between">
           <span>
             Plaid API credentials{" "}
-            {compact && <Badge className="ml-2">Configured ({env.data ?? "…"})</Badge>}
+            {compact && (
+              <Badge className="ml-2">Configured ({env.data ?? "…"})</Badge>
+            )}
           </span>
         </CardTitle>
         <CardDescription>
-          From your Plaid dashboard (Team Settings → Keys). The secret is environment-specific;
-          stored in the encrypted secret store.
+          From your Plaid dashboard (Team Settings → Keys). The secret is
+          environment-specific; stored in the encrypted secret store.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">
         <div className="flex items-center gap-3">
-          <Select value={effectiveEnv} onValueChange={(v) => setSelectedEnv(v as PlaidEnv)}>
+          <Select
+            value={effectiveEnv}
+            onValueChange={(v) => setSelectedEnv(v as PlaidEnv)}
+          >
             <SelectTrigger className="w-40">
               <SelectValue />
             </SelectTrigger>
@@ -119,23 +133,36 @@ function ConnectCard({ ctx }: { ctx: AddonContext }) {
   const pollLink = usePollHostedLinkMutation(ctx);
   const items = useItems(ctx);
   const removeItem = useRemoveItemMutation(ctx);
+  const historyDays = useHistoryDays(ctx);
+  const extendLink = useExtendHistoryLinkMutation(ctx);
   const [copied, setCopied] = useState(false);
+  const [extendCopied, setExtendCopied] = useState(false);
+  const [daysInput, setDaysInput] = useState<string | null>(null);
 
   const linkUrl = hostedLink.data?.hosted_link_url;
   const linkToken = hostedLink.data?.link_token;
+  const extendUrl = extendLink.data?.hosted_link_url;
+  const extendItemName =
+    (items.data ?? []).find((i) => i.itemId === extendLink.variables)
+      ?.institutionName ?? "this institution";
 
   return (
     <Card>
       <CardHeader>
         <CardTitle>Institutions</CardTitle>
         <CardDescription>
-          Connect an institution through Plaid Link. Each institution counts as one Plaid Item (10
-          free on the Trial plan).
+          Connect an institution through Plaid Link. Each institution counts as
+          one Plaid Item (10 free on the Trial plan). History depth applies to
+          new connections and to “Extend history”; institutions cap what they
+          actually return.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
         <div className="flex items-center gap-3">
-          <Button onClick={() => hostedLink.mutate()} disabled={hostedLink.isPending}>
+          <Button
+            onClick={() => hostedLink.mutate()}
+            disabled={hostedLink.isPending}
+          >
             {hostedLink.isPending ? "Creating link…" : "Connect an institution"}
           </Button>
           {env.data === "sandbox" && (
@@ -144,16 +171,39 @@ function ConnectCard({ ctx }: { ctx: AddonContext }) {
               onClick={() => sandboxConnect.mutate()}
               disabled={sandboxConnect.isPending}
             >
-              {sandboxConnect.isPending ? "Connecting…" : "Quick connect (sandbox test bank)"}
+              {sandboxConnect.isPending
+                ? "Connecting…"
+                : "Quick connect (sandbox test bank)"}
             </Button>
           )}
+          <div className="ml-auto flex items-center gap-2">
+            <span className="text-muted-foreground text-sm whitespace-nowrap">
+              History (days)
+            </span>
+            <Input
+              type="number"
+              min={1}
+              max={MAX_HISTORY_DAYS}
+              className="w-24"
+              value={
+                daysInput ?? String(historyDays.days.data ?? MAX_HISTORY_DAYS)
+              }
+              onChange={(e) => setDaysInput(e.target.value)}
+              onBlur={() => {
+                if (daysInput !== null && daysInput.trim() !== "") {
+                  historyDays.setDays.mutate(Number(daysInput));
+                }
+                setDaysInput(null);
+              }}
+            />
+          </div>
         </div>
 
         {linkUrl && (
           <div className="space-y-2 rounded-md border p-3">
             <p className="text-sm">
-              Open this link in your browser, sign in to your institution, then come back and press{" "}
-              <strong>Check connection</strong>:
+              Open this link in your browser, sign in to your institution, then
+              come back and press <strong>Check connection</strong>:
             </p>
             <div className="flex items-center gap-2">
               <Input readOnly value={linkUrl} className="flex-1 text-xs" />
@@ -161,7 +211,9 @@ function ConnectCard({ ctx }: { ctx: AddonContext }) {
                 variant="outline"
                 size="sm"
                 onClick={() => {
-                  void navigator.clipboard.writeText(linkUrl).then(() => setCopied(true));
+                  void navigator.clipboard
+                    .writeText(linkUrl)
+                    .then(() => setCopied(true));
                 }}
               >
                 {copied ? "Copied" : "Copy"}
@@ -190,16 +242,52 @@ function ConnectCard({ ctx }: { ctx: AddonContext }) {
                     {item.env}
                   </Badge>
                 </span>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => removeItem.mutate(item.itemId)}
-                  disabled={removeItem.isPending}
-                >
-                  Remove
-                </Button>
+                <span className="flex items-center gap-1">
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => extendLink.mutate(item.itemId)}
+                    disabled={extendLink.isPending}
+                  >
+                    Extend history
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => removeItem.mutate(item.itemId)}
+                    disabled={removeItem.isPending}
+                  >
+                    Remove
+                  </Button>
+                </span>
               </div>
             ))}
+          </div>
+        )}
+
+        {extendUrl && (
+          <div className="space-y-2 rounded-md border p-3">
+            <p className="text-sm">
+              To pull up to {historyDays.days.data ?? MAX_HISTORY_DAYS} days of
+              history for <strong>{extendItemName}</strong>, open this link in
+              your browser and confirm the connection. Plaid backfills in the
+              background — run <strong>Sync now</strong> a few minutes later to
+              import the older transactions.
+            </p>
+            <div className="flex items-center gap-2">
+              <Input readOnly value={extendUrl} className="flex-1 text-xs" />
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  void navigator.clipboard
+                    .writeText(extendUrl)
+                    .then(() => setExtendCopied(true));
+                }}
+              >
+                {extendCopied ? "Copied" : "Copy"}
+              </Button>
+            </div>
           </div>
         )}
       </CardContent>
@@ -225,7 +313,9 @@ function MappingRow({
   const link = mapping.links[plaidId];
   const isIgnored = mapping.ignored.includes(plaidId);
   const kind = link?.kind ?? suggestedKind(row);
-  const selectValue = isIgnored ? IGNORE_OPTION : (link?.wfAccountId ?? UNMAPPED_OPTION);
+  const selectValue = isIgnored
+    ? IGNORE_OPTION
+    : (link?.wfAccountId ?? UNMAPPED_OPTION);
   const currency = row.account.balances.iso_currency_code ?? "USD";
 
   const applyTarget = async (value: string) => {
@@ -256,7 +346,11 @@ function MappingRow({
         providerAccountId: plaidId,
         group: row.institutionName,
       });
-      next.links[plaidId] = { wfAccountId: created.id, kind, itemId: row.itemId };
+      next.links[plaidId] = {
+        wfAccountId: created.id,
+        kind,
+        itemId: row.itemId,
+      };
       ctx.api.toast.success(`Created account "${created.name}"`);
     } else {
       next.links[plaidId] = { wfAccountId: value, kind, itemId: row.itemId };
@@ -279,7 +373,10 @@ function MappingRow({
       </TableCell>
       <TableCell>
         {kind ? (
-          <Select value={selectValue} onValueChange={(v) => void applyTarget(v)}>
+          <Select
+            value={selectValue}
+            onValueChange={(v) => void applyTarget(v)}
+          >
             <SelectTrigger className="w-56">
               <SelectValue />
             </SelectTrigger>
@@ -300,7 +397,9 @@ function MappingRow({
       </TableCell>
       <TableCell>
         {kind ? (
-          <Badge variant="outline">{kind === "INVESTMENTS" ? "Investments" : "Banking"}</Badge>
+          <Badge variant="outline">
+            {kind === "INVESTMENTS" ? "Investments" : "Banking"}
+          </Badge>
         ) : (
           "—"
         )}
@@ -319,16 +418,22 @@ function AccountsCard({ ctx }: { ctx: AddonContext }) {
     <Card>
       <CardHeader>
         <CardTitle>Accounts</CardTitle>
-        <CardDescription>Map each Plaid account to a Wealthfolio account.</CardDescription>
+        <CardDescription>
+          Map each Plaid account to a Wealthfolio account.
+        </CardDescription>
       </CardHeader>
       <CardContent>
-        {plaidAccounts.isLoading || mapping.isLoading || wfAccounts.isLoading ? (
+        {plaidAccounts.isLoading ||
+        mapping.isLoading ||
+        wfAccounts.isLoading ? (
           <div className="space-y-2">
             <Skeleton className="h-8 w-full" />
             <Skeleton className="h-8 w-full" />
           </div>
         ) : plaidAccounts.isError ? (
-          <p className="text-destructive text-sm">{(plaidAccounts.error as Error).message}</p>
+          <p className="text-destructive text-sm">
+            {(plaidAccounts.error as Error).message}
+          </p>
         ) : (
           <Table>
             <TableHeader>
@@ -367,7 +472,9 @@ function SyncCard({ ctx, hasLinks }: { ctx: AddonContext; hasLinks: boolean }) {
     <Card>
       <CardHeader>
         <CardTitle>Sync</CardTitle>
-        <CardDescription>Import transactions for mapped accounts.</CardDescription>
+        <CardDescription>
+          Import transactions for mapped accounts.
+        </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
         <div className="flex items-center gap-3">
@@ -400,14 +507,18 @@ function SyncCard({ ctx, hasLinks }: { ctx: AddonContext; hasLinks: boolean }) {
             {(log.data ?? []).slice(0, 5).map((run) => (
               <div key={run.at} className="rounded-md border p-2 text-xs">
                 <div className="flex items-center justify-between">
-                  <span className="text-muted-foreground">{new Date(run.at).toLocaleString()}</span>
+                  <span className="text-muted-foreground">
+                    {new Date(run.at).toLocaleString()}
+                  </span>
                   {run.error || run.outcomes.some((o) => o.error) ? (
                     <Badge variant="destructive">Errors</Badge>
                   ) : (
                     <Badge variant="secondary">OK</Badge>
                   )}
                 </div>
-                {run.error && <p className="text-destructive mt-1">{run.error}</p>}
+                {run.error && (
+                  <p className="text-destructive mt-1">{run.error}</p>
+                )}
                 {run.outcomes.map((o) => (
                   <p key={o.plaidAccountId} className="mt-1">
                     {o.name}:{" "}
@@ -415,6 +526,9 @@ function SyncCard({ ctx, hasLinks }: { ctx: AddonContext; hasLinks: boolean }) {
                       <span className="text-destructive">{o.error}</span>
                     ) : (
                       `${o.imported} imported, ${o.duplicates} duplicates${o.skippedRows ? `, ${o.skippedRows} skipped` : ""}`
+                    )}
+                    {!o.error && o.note && (
+                      <span className="text-muted-foreground"> — {o.note}</span>
                     )}
                   </p>
                 ))}
@@ -438,7 +552,9 @@ export function SettingsPage({ ctx }: { ctx: AddonContext }) {
     <div className="space-y-6 p-6">
       <div>
         <h1 className="text-2xl font-semibold">Plaid Sync</h1>
-        <p className="text-muted-foreground">Auto-sync bank and brokerage accounts via Plaid.</p>
+        <p className="text-muted-foreground">
+          Auto-sync bank and brokerage accounts via Plaid.
+        </p>
       </div>
       {configured.isLoading ? (
         <Skeleton className="h-40 w-full" />
@@ -447,7 +563,9 @@ export function SettingsPage({ ctx }: { ctx: AddonContext }) {
           <CredentialsCard ctx={ctx} compact={Boolean(configured.data)} />
           {configured.data && <ConnectCard ctx={ctx} />}
           {configured.data && hasItems && <AccountsCard ctx={ctx} />}
-          {configured.data && hasItems && <SyncCard ctx={ctx} hasLinks={hasLinks} />}
+          {configured.data && hasItems && (
+            <SyncCard ctx={ctx} hasLinks={hasLinks} />
+          )}
         </>
       )}
     </div>

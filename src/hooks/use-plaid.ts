@@ -17,6 +17,7 @@ const K = {
   mapping: ["plaid-sync", "mapping"] as const,
   syncLog: ["plaid-sync", "sync-log"] as const,
   autoSyncHours: ["plaid-sync", "auto-sync-hours"] as const,
+  historyDays: ["plaid-sync", "history-days"] as const,
 };
 
 export function usePlaidClient(ctx: AddonContext): PlaidClient {
@@ -25,7 +26,10 @@ export function usePlaidClient(ctx: AddonContext): PlaidClient {
 
 export function useConfigured(ctx: AddonContext) {
   const client = usePlaidClient(ctx);
-  return useQuery({ queryKey: K.configured, queryFn: () => client.isConfigured() });
+  return useQuery({
+    queryKey: K.configured,
+    queryFn: () => client.isConfigured(),
+  });
 }
 
 export function usePlaidEnv(ctx: AddonContext) {
@@ -37,8 +41,15 @@ export function useSaveCredentialsMutation(ctx: AddonContext) {
   const client = usePlaidClient(ctx);
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: ({ clientId, secret, env }: { clientId: string; secret: string; env: PlaidEnv }) =>
-      client.saveCredentials(clientId, secret, env),
+    mutationFn: ({
+      clientId,
+      secret,
+      env,
+    }: {
+      clientId: string;
+      secret: string;
+      env: PlaidEnv;
+    }) => client.saveCredentials(clientId, secret, env),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: K.configured });
       queryClient.invalidateQueries({ queryKey: K.env });
@@ -70,7 +81,11 @@ export function usePlaidAccounts(ctx: AddonContext, enabled: boolean) {
       for (const item of items) {
         const accounts = await client.getAccounts(item.itemId);
         for (const account of accounts) {
-          rows.push({ itemId: item.itemId, institutionName: item.institutionName, account });
+          rows.push({
+            itemId: item.itemId,
+            institutionName: item.institutionName,
+            account,
+          });
         }
       }
       return rows;
@@ -113,9 +128,34 @@ export function usePollHostedLinkMutation(ctx: AddonContext) {
         queryClient.invalidateQueries({ queryKey: K.plaidAccounts });
         ctx.api.toast.success("Institution connected");
       } else {
-        ctx.api.toast.info("Link session not finished yet — complete it in the browser first");
+        ctx.api.toast.info(
+          "Link session not finished yet — complete it in the browser first",
+        );
       }
     },
+    onError: (error: Error) => ctx.api.toast.error(error.message),
+  });
+}
+
+export function useHistoryDays(ctx: AddonContext) {
+  const client = usePlaidClient(ctx);
+  const queryClient = useQueryClient();
+  const days = useQuery({
+    queryKey: K.historyDays,
+    queryFn: () => client.getHistoryDays(),
+  });
+  const setDays = useMutation({
+    mutationFn: (value: number) => client.setHistoryDays(value),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: K.historyDays }),
+    onError: (error: Error) => ctx.api.toast.error(error.message),
+  });
+  return { days, setDays };
+}
+
+export function useExtendHistoryLinkMutation(ctx: AddonContext) {
+  const client = usePlaidClient(ctx);
+  return useMutation({
+    mutationFn: (itemId: string) => client.createExtendHistoryLink(itemId),
     onError: (error: Error) => ctx.api.toast.error(error.message),
   });
 }
@@ -170,8 +210,10 @@ export function useAutoSyncHours(ctx: AddonContext) {
     queryFn: () => getAutoSyncHours(ctx),
   });
   const setHours = useMutation({
-    mutationFn: (value: number) => ctx.api.storage.set(AUTO_SYNC_HOURS_KEY, String(value)),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: K.autoSyncHours }),
+    mutationFn: (value: number) =>
+      ctx.api.storage.set(AUTO_SYNC_HOURS_KEY, String(value)),
+    onSuccess: () =>
+      queryClient.invalidateQueries({ queryKey: K.autoSyncHours }),
     onError: (error: Error) => ctx.api.toast.error(error.message),
   });
   return { hours, setHours };

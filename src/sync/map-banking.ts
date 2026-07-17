@@ -11,8 +11,31 @@ import type { PlaidAccount, PlaidTransaction } from "../plaid/types";
 
 const INTEREST_PATTERN = /\binterest\b/i;
 const FEE_PATTERN = /\b(?:fee|fees|service charge)\b/i;
+const CARD_PAYMENT_PATTERN = /\bautopay\b|automatic payment|payment[ -]+thank/i;
 
-function classify(tx: PlaidTransaction): ActivityType {
+/** Payment received by a credit card (reduces the debt). */
+function isCardPayment(
+  tx: PlaidTransaction,
+  plaidAccountType?: string,
+): boolean {
+  if (plaidAccountType !== "credit") return false;
+  if (tx.personal_finance_category?.primary === "LOAN_PAYMENTS") return true;
+  return CARD_PAYMENT_PATTERN.test(
+    `${tx.name ?? ""} ${tx.merchant_name ?? ""}`,
+  );
+}
+
+function classify(
+  tx: PlaidTransaction,
+  plaidAccountType?: string,
+): ActivityType {
+  // Money INTO a credit card must be CREDIT — the host rejects DEPOSIT on
+  // CREDIT_CARD accounts. Payments are matched by category/name rather than
+  // sign because some institutions (and the Plaid sandbox) report them with
+  // the same positive sign as purchases; refunds arrive as negative amounts.
+  if (plaidAccountType === "credit") {
+    if (isCardPayment(tx, plaidAccountType) || tx.amount < 0) return "CREDIT";
+  }
   const text = `${tx.name ?? ""} ${tx.merchant_name ?? ""}`;
   const outflow = tx.amount > 0;
   if (outflow) {
@@ -26,11 +49,12 @@ export function mapBankingTransaction(
   wfAccountId: string,
   fallbackCurrency: string,
   lineNumber: number,
+  plaidAccountType?: string,
 ): ActivityImport {
   return {
     accountId: wfAccountId,
     currency: tx.iso_currency_code ?? fallbackCurrency,
-    activityType: classify(tx),
+    activityType: classify(tx, plaidAccountType),
     date: tx.date,
     symbol: "",
     amount: Math.abs(tx.amount).toFixed(2),
@@ -46,11 +70,20 @@ export function mapBankingTransactions(
   transactions: PlaidTransaction[],
   wfAccountId: string,
   fallbackCurrency: string,
+  plaidAccountType?: string,
 ): ActivityImport[] {
   return transactions
     .filter((tx) => !tx.pending)
     .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0))
-    .map((tx, i) => mapBankingTransaction(tx, wfAccountId, fallbackCurrency, i + 1));
+    .map((tx, i) =>
+      mapBankingTransaction(
+        tx,
+        wfAccountId,
+        fallbackCurrency,
+        i + 1,
+        plaidAccountType,
+      ),
+    );
 }
 
 /**
@@ -75,9 +108,14 @@ export function buildBankingAnchor(
   if (!Number.isFinite(residue) || residue === 0) return null;
 
   const earliest = posted.length
-    ? posted.reduce((min, tx) => (tx.date < min ? tx.date : min), posted[0].date)
+    ? posted.reduce(
+        (min, tx) => (tx.date < min ? tx.date : min),
+        posted[0].date,
+      )
     : new Date().toISOString().slice(0, 10);
-  const anchorDate = new Date(new Date(`${earliest}T00:00:00Z`).getTime() - 86400_000)
+  const anchorDate = new Date(
+    new Date(`${earliest}T00:00:00Z`).getTime() - 86400_000,
+  )
     .toISOString()
     .slice(0, 10);
 

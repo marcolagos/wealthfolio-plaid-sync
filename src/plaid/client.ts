@@ -15,6 +15,16 @@ export const CLIENT_ID_SECRET_KEY = "plaid-client-id";
 export const API_SECRET_SECRET_KEY = "plaid-secret";
 export const ENV_STORAGE_KEY = "plaid-env";
 export const ITEMS_STORAGE_KEY = "plaid-items";
+export const HISTORY_DAYS_STORAGE_KEY = "plaid-history-days";
+
+/** Plaid's hard cap for transactions.days_requested (24 months). */
+export const MAX_HISTORY_DAYS = 730;
+const DEFAULT_HISTORY_DAYS = 730;
+
+function clampHistoryDays(days: number): number {
+  if (!Number.isFinite(days)) return DEFAULT_HISTORY_DAYS;
+  return Math.min(MAX_HISTORY_DAYS, Math.max(1, Math.round(days)));
+}
 
 const BASE_URLS: Record<PlaidEnv, string> = {
   sandbox: "https://sandbox.plaid.com",
@@ -56,7 +66,27 @@ export class PlaidClient {
     return Boolean(clientId && secret);
   }
 
-  async saveCredentials(clientId: string, secret: string, env: PlaidEnv): Promise<void> {
+  /** How many days of transaction history to request from Plaid (1–730). */
+  async getHistoryDays(): Promise<number> {
+    const raw = await this.ctx.api.storage.get(HISTORY_DAYS_STORAGE_KEY);
+    const parsed = Number(raw);
+    return raw && Number.isFinite(parsed)
+      ? clampHistoryDays(parsed)
+      : DEFAULT_HISTORY_DAYS;
+  }
+
+  async setHistoryDays(days: number): Promise<void> {
+    await this.ctx.api.storage.set(
+      HISTORY_DAYS_STORAGE_KEY,
+      String(clampHistoryDays(days)),
+    );
+  }
+
+  async saveCredentials(
+    clientId: string,
+    secret: string,
+    env: PlaidEnv,
+  ): Promise<void> {
     await this.ctx.api.secrets.set(CLIENT_ID_SECRET_KEY, clientId.trim());
     await this.ctx.api.secrets.set(API_SECRET_SECRET_KEY, secret.trim());
     await this.ctx.api.storage.set(ENV_STORAGE_KEY, env);
@@ -84,7 +114,11 @@ export class PlaidClient {
    * (Plaid's documented auth style). Credentials never leave the encrypted
    * secret store except to be embedded per-request here.
    */
-  private async post<T>(env: PlaidEnv, path: string, body: Record<string, unknown>): Promise<T> {
+  private async post<T>(
+    env: PlaidEnv,
+    path: string,
+    body: Record<string, unknown>,
+  ): Promise<T> {
     const [clientId, secret] = await Promise.all([
       this.ctx.api.secrets.get(CLIENT_ID_SECRET_KEY),
       this.ctx.api.secrets.get(API_SECRET_SECRET_KEY),
@@ -111,7 +145,8 @@ export class PlaidClient {
         break;
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        const transient = /error sending request|timed out|timeout|network/i.test(message);
+        const transient =
+          /error sending request|timed out|timeout|network/i.test(message);
         if (!transient || attempt >= MAX_ATTEMPTS) throw error;
         await new Promise((resolve) => setTimeout(resolve, attempt * 1500));
       }
@@ -125,7 +160,9 @@ export class PlaidClient {
       }
       const code = plaidError.error_code ?? `HTTP ${res.status}`;
       const message =
-        plaidError.display_message ?? plaidError.error_message ?? "Plaid request failed";
+        plaidError.display_message ??
+        plaidError.error_message ??
+        "Plaid request failed";
       throw new Error(`${code}: ${message}`);
     }
     return JSON.parse(res.body) as T;
@@ -139,8 +176,11 @@ export class PlaidClient {
     const items = await this.listItems();
     const item = items.find((i) => i.itemId === itemId);
     if (!item) throw new Error(`Unknown Plaid item ${itemId}`);
-    const accessToken = await this.ctx.api.secrets.get(accessTokenSecretKey(itemId));
-    if (!accessToken) throw new Error("Access token missing — reconnect this institution");
+    const accessToken = await this.ctx.api.secrets.get(
+      accessTokenSecretKey(itemId),
+    );
+    if (!accessToken)
+      throw new Error("Access token missing — reconnect this institution");
     return this.post<T>(item.env, path, { access_token: accessToken, ...body });
   }
 
@@ -158,7 +198,10 @@ export class PlaidClient {
         public_token: publicToken,
       },
     );
-    await this.ctx.api.secrets.set(accessTokenSecretKey(exchanged.item_id), exchanged.access_token);
+    await this.ctx.api.secrets.set(
+      accessTokenSecretKey(exchanged.item_id),
+      exchanged.access_token,
+    );
     const item: PlaidItemRef = {
       itemId: exchanged.item_id,
       env,
@@ -166,24 +209,39 @@ export class PlaidClient {
       connectedAt: new Date().toISOString(),
     };
     const items = await this.listItems();
-    await this.saveItems([...items.filter((i) => i.itemId !== item.itemId), item]);
+    await this.saveItems([
+      ...items.filter((i) => i.itemId !== item.itemId),
+      item,
+    ]);
     return item;
   }
 
   /** Sandbox-only: connect a test institution without the Link UI. */
-  async sandboxQuickConnect(institutionId = "ins_109508"): Promise<PlaidItemRef> {
+  async sandboxQuickConnect(
+    institutionId = "ins_109508",
+  ): Promise<PlaidItemRef> {
     const env = await this.getEnv();
     if (env !== "sandbox")
-      throw new Error("Quick connect is only available in the sandbox environment");
+      throw new Error(
+        "Quick connect is only available in the sandbox environment",
+      );
     // transactions-only creation is fast; requesting investments up front makes
     // Plaid generate all investment history synchronously and blows past the
     // network broker's 10s timeout (and each retry starts a fresh item, so
     // retrying never helps). Investments initializes lazily on first use.
-    const created = await this.post<{ public_token: string }>(env, "/sandbox/public_token/create", {
-      institution_id: institutionId,
-      initial_products: ["transactions"],
-    });
-    return this.registerItem(env, created.public_token, `Sandbox (${institutionId})`);
+    const created = await this.post<{ public_token: string }>(
+      env,
+      "/sandbox/public_token/create",
+      {
+        institution_id: institutionId,
+        initial_products: ["transactions"],
+      },
+    );
+    return this.registerItem(
+      env,
+      created.public_token,
+      `Sandbox (${institutionId})`,
+    );
   }
 
   /**
@@ -202,7 +260,32 @@ export class PlaidClient {
       country_codes: ["US"],
       language: "en",
       hosted_link: {},
+      transactions: { days_requested: await this.getHistoryDays() },
     });
+  }
+
+  /**
+   * Update-mode Hosted Link for an existing item, requesting a deeper
+   * transaction history window. After the user completes it in the browser,
+   * Plaid backfills asynchronously and /transactions/sync delivers the older
+   * transactions with stable IDs (dedup absorbs the overlap). Update mode
+   * produces no public token, so there is nothing to poll or exchange.
+   */
+  async createExtendHistoryLink(
+    itemId: string,
+  ): Promise<LinkTokenCreateResponse> {
+    return this.postForItem<LinkTokenCreateResponse>(
+      itemId,
+      "/link/token/create",
+      {
+        user: { client_user_id: "wealthfolio-plaid-sync" },
+        client_name: "Wealthfolio",
+        country_codes: ["US"],
+        language: "en",
+        hosted_link: {},
+        transactions: { days_requested: await this.getHistoryDays() },
+      },
+    );
   }
 
   /** Returns the new item if the hosted Link session has completed, else null. */
@@ -234,7 +317,11 @@ export class PlaidClient {
   // ── Data ─────────────────────────────────────────────────────────
 
   async getAccounts(itemId: string): Promise<PlaidAccount[]> {
-    const res = await this.postForItem<{ accounts: PlaidAccount[] }>(itemId, "/accounts/get", {});
+    const res = await this.postForItem<{ accounts: PlaidAccount[] }>(
+      itemId,
+      "/accounts/get",
+      {},
+    );
     return res.accounts;
   }
 
@@ -242,14 +329,24 @@ export class PlaidClient {
     itemId: string,
     cursor: string | undefined,
   ): Promise<TransactionsSyncResponse> {
-    return this.postForItem<TransactionsSyncResponse>(itemId, "/transactions/sync", {
-      ...(cursor ? { cursor } : {}),
-      count: 500,
-    });
+    return this.postForItem<TransactionsSyncResponse>(
+      itemId,
+      "/transactions/sync",
+      {
+        ...(cursor ? { cursor } : {}),
+        count: 500,
+      },
+    );
   }
 
-  async investmentsHoldings(itemId: string): Promise<InvestmentsHoldingsResponse> {
-    return this.postForItem<InvestmentsHoldingsResponse>(itemId, "/investments/holdings/get", {});
+  async investmentsHoldings(
+    itemId: string,
+  ): Promise<InvestmentsHoldingsResponse> {
+    return this.postForItem<InvestmentsHoldingsResponse>(
+      itemId,
+      "/investments/holdings/get",
+      {},
+    );
   }
 
   async investmentsTransactions(

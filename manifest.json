@@ -1,7 +1,7 @@
 {
   "id": "plaid-sync",
   "name": "Plaid Sync",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Auto-sync bank and brokerage accounts via Plaid",
   "author": "Marco Lagos",
   "main": "dist/addon.js",

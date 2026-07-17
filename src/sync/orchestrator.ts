@@ -8,7 +8,10 @@ import type {
   PlaidTransaction,
 } from "../plaid/types";
 import { buildBankingAnchor, mapBankingTransactions } from "./map-banking";
-import { buildInvestmentBaseline, mapInvestmentTransactions } from "./map-investments";
+import {
+  buildInvestmentBaseline,
+  mapInvestmentTransactions,
+} from "./map-investments";
 
 const STATE_KEY = "plaid-sync-state";
 const LOG_KEY = "plaid-sync-log";
@@ -35,6 +38,8 @@ export interface AccountSyncOutcome {
   imported: number;
   duplicates: number;
   skippedRows: number;
+  /** Informational detail (e.g. why rows were skipped) — not a failure. */
+  note?: string;
   error?: string;
 }
 
@@ -71,9 +76,15 @@ export async function loadSyncLog(ctx: AddonContext): Promise<SyncRunResult[]> {
   }
 }
 
-async function appendSyncLog(ctx: AddonContext, entry: SyncRunResult): Promise<void> {
+async function appendSyncLog(
+  ctx: AddonContext,
+  entry: SyncRunResult,
+): Promise<void> {
   const log = await loadSyncLog(ctx);
-  await ctx.api.storage.set(LOG_KEY, JSON.stringify([entry, ...log].slice(0, LOG_LIMIT)));
+  await ctx.api.storage.set(
+    LOG_KEY,
+    JSON.stringify([entry, ...log].slice(0, LOG_LIMIT)),
+  );
 }
 
 function isoDaysAgo(days: number): string {
@@ -100,13 +111,35 @@ const IMPORT_CHUNK_SIZE = 150;
 async function importRows(
   ctx: AddonContext,
   rows: ActivityImport[],
-): Promise<{ imported: number; duplicates: number }> {
+): Promise<{
+  imported: number;
+  duplicates: number;
+  invalid: number;
+  invalidExample?: string;
+}> {
   let imported = 0;
   let duplicates = 0;
+  let invalid = 0;
+  let invalidExample: string | undefined;
   for (let i = 0; i < rows.length; i += IMPORT_CHUNK_SIZE) {
     const chunk = rows.slice(i, i + IMPORT_CHUNK_SIZE);
     const checked = await ctx.api.activities.checkImport(chunk);
     duplicates += checked.filter((r) => r.duplicateOfId).length;
+    // Rows the check marks invalid would otherwise vanish silently — count
+    // them and keep one example so the sync log shows what was rejected.
+    const invalidRows = checked.filter((r) => !r.isValid && !r.duplicateOfId);
+    if (invalidRows.length > 0) {
+      invalid += invalidRows.length;
+      if (!invalidExample) {
+        const first = invalidRows[0];
+        const detail = first.errors
+          ? Object.entries(first.errors)
+              .map(([field, msgs]) => `${field}: ${msgs.join("; ")}`)
+              .join(", ")
+          : "no error detail";
+        invalidExample = `"${first.comment ?? first.activityType}" → ${detail}`;
+      }
+    }
     const importable = checked.filter((r) => r.isValid && !r.duplicateOfId);
     if (importable.length === 0) continue;
 
@@ -116,7 +149,9 @@ async function importRows(
     if (cashRows.length > 0) {
       const result = await ctx.api.activities.import(cashRows);
       if (!result.summary.success) {
-        throw new Error("Import finished with errors — check the import history");
+        throw new Error(
+          "Import finished with errors — check the import history",
+        );
       }
       imported += result.summary.imported;
       duplicates += result.summary.duplicates;
@@ -127,7 +162,9 @@ async function importRows(
         accountId: r.accountId,
         activityType: r.activityType,
         activityDate:
-          typeof r.date === "string" ? r.date : (r.date?.toISOString().slice(0, 10) ?? ""),
+          typeof r.date === "string"
+            ? r.date
+            : (r.date?.toISOString().slice(0, 10) ?? ""),
         asset: {
           symbol: (r.symbol ?? "").trim(),
           exchangeMic: r.exchangeMic,
@@ -151,8 +188,12 @@ async function importRows(
       try {
         const result = await ctx.api.activities.saveMany({ creates });
         imported += result.created.length;
-        duplicates += result.errors.filter((e) => /duplicate/i.test(e.message)).length;
-        const realErrors = result.errors.filter((e) => !/duplicate/i.test(e.message));
+        duplicates += result.errors.filter((e) =>
+          /duplicate/i.test(e.message),
+        ).length;
+        const realErrors = result.errors.filter(
+          (e) => !/duplicate/i.test(e.message),
+        );
         if (realErrors.length > 0) {
           throw new Error(
             `${realErrors.length} activities failed to save (e.g. ${realErrors[0].message})`,
@@ -163,11 +204,16 @@ async function importRows(
         if (!/duplicate/i.test(message)) throw error;
         for (const create of creates) {
           try {
-            const single = await ctx.api.activities.saveMany({ creates: [create] });
+            const single = await ctx.api.activities.saveMany({
+              creates: [create],
+            });
             imported += single.created.length;
-            duplicates += single.errors.filter((e) => /duplicate/i.test(e.message)).length;
+            duplicates += single.errors.filter((e) =>
+              /duplicate/i.test(e.message),
+            ).length;
           } catch (rowError) {
-            const rowMessage = rowError instanceof Error ? rowError.message : String(rowError);
+            const rowMessage =
+              rowError instanceof Error ? rowError.message : String(rowError);
             if (!/duplicate/i.test(rowMessage)) throw rowError;
             duplicates += 1;
           }
@@ -175,7 +221,7 @@ async function importRows(
       }
     }
   }
-  return { imported, duplicates };
+  return { imported, duplicates, invalid, invalidExample };
 }
 
 async function syncItemBanking(
@@ -189,7 +235,9 @@ async function syncItemBanking(
 ): Promise<void> {
   // A newly mapped account needs history the current cursor already consumed:
   // restart from scratch and let dedup absorb the overlap.
-  const hasNewAccount = mapped.some((m) => !state.baselined.includes(m.plaidAccountId));
+  const hasNewAccount = mapped.some(
+    (m) => !state.baselined.includes(m.plaidAccountId),
+  );
   let cursor = hasNewAccount ? undefined : state.cursors[item.itemId];
 
   const added: PlaidTransaction[] = [];
@@ -212,17 +260,34 @@ async function syncItemBanking(
       skippedRows: 0,
     };
     try {
-      const accountTxns = added.filter((t) => t.account_id === m.plaidAccountId);
+      const accountTxns = added.filter(
+        (t) => t.account_id === m.plaidAccountId,
+      );
       const currency = account?.balances.iso_currency_code ?? "USD";
-      const rows = mapBankingTransactions(accountTxns, m.wfAccountId, currency);
+      const rows = mapBankingTransactions(
+        accountTxns,
+        m.wfAccountId,
+        currency,
+        account?.type,
+      );
       if (!state.baselined.includes(m.plaidAccountId) && account) {
         const anchor = buildBankingAnchor(account, accountTxns, m.wfAccountId);
         if (anchor) rows.unshift(anchor);
       }
-      const { imported, duplicates } = await importRows(ctx, rows);
+      const { imported, duplicates, invalid, invalidExample } =
+        await importRows(ctx, rows);
       outcome.imported = imported;
       outcome.duplicates = duplicates;
-      if (!state.baselined.includes(m.plaidAccountId)) state.baselined.push(m.plaidAccountId);
+      if (invalid > 0) {
+        // Rows the host's import validation rejects (e.g. a symbol market
+        // data can't resolve) are permanent — retrying can't fix them, so
+        // don't fail the account or hold the cursor. Count them as skipped
+        // and explain in the log.
+        outcome.skippedRows += invalid;
+        outcome.note = `${invalid} row(s) rejected by import validation — e.g. ${invalidExample}`;
+      }
+      if (!state.baselined.includes(m.plaidAccountId))
+        state.baselined.push(m.plaidAccountId);
     } catch (error) {
       outcome.error = error instanceof Error ? error.message : String(error);
       allOk = false;
@@ -248,10 +313,15 @@ async function syncItemInvestments(
 ): Promise<void> {
   const today = new Date().toISOString().slice(0, 10);
   const checkpoint = state.invCheckpoints[item.itemId];
-  const hasNewAccount = mapped.some((m) => !state.baselined.includes(m.plaidAccountId));
+  const hasNewAccount = mapped.some(
+    (m) => !state.baselined.includes(m.plaidAccountId),
+  );
   const startDate =
     checkpoint && !hasNewAccount
-      ? new Date(new Date(`${checkpoint}T00:00:00Z`).getTime() - OVERLAP_DAYS * 86400_000)
+      ? new Date(
+          new Date(`${checkpoint}T00:00:00Z`).getTime() -
+            OVERLAP_DAYS * 86400_000,
+        )
           .toISOString()
           .slice(0, 10)
       : isoDaysAgo(INITIAL_LOOKBACK_DAYS);
@@ -273,16 +343,26 @@ async function syncItemInvestments(
     const to = new Date(windowEnd).toISOString().slice(0, 10);
     let offset = 0;
     for (;;) {
-      const page = await client.investmentsTransactions(item.itemId, from, to, offset);
+      const page = await client.investmentsTransactions(
+        item.itemId,
+        from,
+        to,
+        offset,
+      );
       transactions.push(...page.investment_transactions);
       for (const s of page.securities) securities.set(s.security_id, s);
       offset += page.investment_transactions.length;
-      if (offset >= page.total_investment_transactions || page.investment_transactions.length === 0)
+      if (
+        offset >= page.total_investment_transactions ||
+        page.investment_transactions.length === 0
+      )
         break;
     }
   }
 
-  let holdingsCache: Awaited<ReturnType<PlaidClient["investmentsHoldings"]>> | null = null;
+  let holdingsCache: Awaited<
+    ReturnType<PlaidClient["investmentsHoldings"]>
+  > | null = null;
   let allOk = true;
   for (const m of mapped) {
     const account = plaidAccounts.get(m.plaidAccountId);
@@ -295,7 +375,9 @@ async function syncItemInvestments(
       skippedRows: 0,
     };
     try {
-      const accountTxns = transactions.filter((t) => t.account_id === m.plaidAccountId);
+      const accountTxns = transactions.filter(
+        (t) => t.account_id === m.plaidAccountId,
+      );
       const currency = account?.balances.iso_currency_code ?? "USD";
       const { rows, skipped } = mapInvestmentTransactions(
         accountTxns,
@@ -306,10 +388,15 @@ async function syncItemInvestments(
       outcome.skippedRows = skipped.length;
 
       if (!state.baselined.includes(m.plaidAccountId)) {
-        if (!holdingsCache) holdingsCache = await client.investmentsHoldings(item.itemId);
-        for (const s of holdingsCache.securities) securities.set(s.security_id, s);
+        if (!holdingsCache)
+          holdingsCache = await client.investmentsHoldings(item.itemId);
+        for (const s of holdingsCache.securities)
+          securities.set(s.security_id, s);
         const earliest = accountTxns.length
-          ? accountTxns.reduce((min, t) => (t.date < min ? t.date : min), accountTxns[0].date)
+          ? accountTxns.reduce(
+              (min, t) => (t.date < min ? t.date : min),
+              accountTxns[0].date,
+            )
           : null;
         const baseline = buildInvestmentBaseline(
           holdingsCache.holdings,
@@ -323,10 +410,20 @@ async function syncItemInvestments(
         rows.unshift(...baseline);
       }
 
-      const { imported, duplicates } = await importRows(ctx, rows);
+      const { imported, duplicates, invalid, invalidExample } =
+        await importRows(ctx, rows);
       outcome.imported = imported;
       outcome.duplicates = duplicates;
-      if (!state.baselined.includes(m.plaidAccountId)) state.baselined.push(m.plaidAccountId);
+      if (invalid > 0) {
+        // Rows the host's import validation rejects (e.g. a symbol market
+        // data can't resolve) are permanent — retrying can't fix them, so
+        // don't fail the account or hold the cursor. Count them as skipped
+        // and explain in the log.
+        outcome.skippedRows += invalid;
+        outcome.note = `${invalid} row(s) rejected by import validation — e.g. ${invalidExample}`;
+      }
+      if (!state.baselined.includes(m.plaidAccountId))
+        state.baselined.push(m.plaidAccountId);
     } catch (error) {
       outcome.error = error instanceof Error ? error.message : String(error);
       allOk = false;
@@ -336,6 +433,32 @@ async function syncItemInvestments(
 
   if (allOk) {
     state.invCheckpoints[item.itemId] = today;
+  }
+}
+
+/**
+ * Item-level fetch failures (e.g. PRODUCTS_NOT_SUPPORTED from an institution
+ * that lacks a product) must not abort the rest of the run: record them on
+ * each affected account and move on, so other institutions still sync and
+ * state still saves.
+ */
+function recordItemFailure(
+  outcomes: AccountSyncOutcome[],
+  item: PlaidItemRef,
+  links: { plaidAccountId: string; kind: SyncKind }[],
+  error: unknown,
+): void {
+  const message = error instanceof Error ? error.message : String(error);
+  for (const link of links) {
+    outcomes.push({
+      plaidAccountId: link.plaidAccountId,
+      name: `${item.institutionName ?? item.itemId} (${link.kind === "INVESTMENTS" ? "investments" : "banking"})`,
+      kind: link.kind,
+      imported: 0,
+      duplicates: 0,
+      skippedRows: 0,
+      error: message,
+    });
   }
 }
 
@@ -363,36 +486,41 @@ export async function runSync(ctx: AddonContext): Promise<SyncRunResult> {
           (await client.getAccounts(item.itemId)).map((a) => [a.account_id, a]),
         );
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        for (const link of links) {
-          run.outcomes.push({
-            plaidAccountId: link.plaidAccountId,
-            name: item.institutionName ?? link.plaidAccountId,
-            kind: link.kind,
-            imported: 0,
-            duplicates: 0,
-            skippedRows: 0,
-            error: message,
-          });
-        }
+        recordItemFailure(run.outcomes, item, links, error);
         continue;
       }
 
       const banking = links.filter((l) => l.kind === "BANKING");
       const investments = links.filter((l) => l.kind === "INVESTMENTS");
       if (banking.length > 0) {
-        await syncItemBanking(ctx, client, item, banking, plaidAccounts, state, run.outcomes);
+        try {
+          await syncItemBanking(
+            ctx,
+            client,
+            item,
+            banking,
+            plaidAccounts,
+            state,
+            run.outcomes,
+          );
+        } catch (error) {
+          recordItemFailure(run.outcomes, item, banking, error);
+        }
       }
       if (investments.length > 0) {
-        await syncItemInvestments(
-          ctx,
-          client,
-          item,
-          investments,
-          plaidAccounts,
-          state,
-          run.outcomes,
-        );
+        try {
+          await syncItemInvestments(
+            ctx,
+            client,
+            item,
+            investments,
+            plaidAccounts,
+            state,
+            run.outcomes,
+          );
+        } catch (error) {
+          recordItemFailure(run.outcomes, item, investments, error);
+        }
       }
     }
 

@@ -36,6 +36,11 @@ export interface PlaidTransaction {
   amount: number;
   iso_currency_code: string | null;
   pending: boolean;
+  /** Plaid's unified category taxonomy (populated for most institutions). */
+  personal_finance_category?: {
+    primary?: string;
+    detailed?: string;
+  } | null;
 }
 
 export interface TransactionsSyncResponse {
