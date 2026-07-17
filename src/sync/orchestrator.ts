@@ -115,8 +115,36 @@ function isoDaysAgo(days: number): string {
  * request timeout. Chunks keep each request fast, and the server caches
  * resolved symbols/assets so later chunks speed up. Chunks run oldest-first,
  * so DB-side duplicate checks cover earlier chunks of the same run.
+ *
+ * 50 (not 150): a chunk of ~150 distinct cold brokerage symbols can itself
+ * blow the 30s market-data-resolution budget on a small/slow instance (e.g.
+ * Render Starter), stalling the whole account. Smaller chunks resolve within
+ * budget, and once assets are cached later chunks fly.
  */
-const IMPORT_CHUNK_SIZE = 150;
+const IMPORT_CHUNK_SIZE = 50;
+
+/**
+ * checkImport/import/saveMany resolve symbols against market data and can hit
+ * the server's 30s request timeout on the first cold chunk. Those calls are
+ * idempotent (checkImport is read-only; import/saveMany dedup), and a timed-
+ * out attempt still warms the server's quote cache — so retrying lets the
+ * next attempt finish. Non-timeout errors propagate immediately.
+ */
+async function retryOnTimeout<T>(fn: () => Promise<T>): Promise<T> {
+  const MAX_ATTEMPTS = 4;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const timedOut = /request timeout|timed out|timeout|408|deadline/i.test(
+        message,
+      );
+      if (!timedOut || attempt >= MAX_ATTEMPTS) throw error;
+      await new Promise((resolve) => setTimeout(resolve, attempt * 1000));
+    }
+  }
+}
 
 /** A symbol row the host rejected purely because the ticker isn't in market
  *  data (institutional 401k funds, delisted names). These are real holdings —
@@ -173,7 +201,9 @@ async function saveCreates(
   let imported = 0;
   let duplicates = 0;
   try {
-    const result = await ctx.api.activities.saveMany({ creates });
+    const result = await retryOnTimeout(() =>
+      ctx.api.activities.saveMany({ creates }),
+    );
     imported += result.created.length;
     duplicates += result.errors.filter((e) =>
       /duplicate/i.test(e.message),
@@ -233,7 +263,9 @@ async function importRows(
   let invalidExample: string | undefined;
   for (let i = 0; i < rows.length; i += IMPORT_CHUNK_SIZE) {
     const chunk = rows.slice(i, i + IMPORT_CHUNK_SIZE);
-    const checked = await ctx.api.activities.checkImport(chunk);
+    const checked = await retryOnTimeout(() =>
+      ctx.api.activities.checkImport(chunk),
+    );
     duplicates += checked.filter((r) => r.duplicateOfId).length;
 
     // Split the rejects: unresolvable-symbol rows get a manual-quote retry;
@@ -260,7 +292,9 @@ async function importRows(
     const assetRows = importable.filter((r) => (r.symbol ?? "").trim());
 
     if (cashRows.length > 0) {
-      const result = await ctx.api.activities.import(cashRows);
+      const result = await retryOnTimeout(() =>
+        ctx.api.activities.import(cashRows),
+      );
       if (!result.summary.success) {
         throw new Error(
           "Import finished with errors — check the import history",

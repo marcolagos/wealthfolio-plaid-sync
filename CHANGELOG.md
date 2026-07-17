@@ -4,6 +4,18 @@ All notable changes to this addon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2] - 2026-07-18
+
+### Fixed
+
+- **Large investment accounts could stall on the first sync.** A 150-row
+  import chunk of cold brokerage symbols can exceed the server's 30s
+  market-data-resolution timeout on a small/slow instance (e.g. Render
+  Starter), erroring the whole account with "Request Timeout" and importing
+  nothing. Chunk size reduced to 50, and checkImport/import/saveMany now
+  retry on timeout (a timed-out attempt still warms the server's quote cache,
+  so the retry completes). Fast instances are unaffected.
+
 ## [0.3.1] - 2026-07-18
 
 ### Fixed
